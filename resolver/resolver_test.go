@@ -133,7 +133,7 @@ func TestAtomicZoneUpdate(t *testing.T) {
 					return
 				default:
 				}
-				z := r.zones["ex.test"].Current()
+				z := r.view.Load().zone("ex.test")
 				a, b := z.lookup("a.ex.test")[0], z.lookup("b.ex.test")[0]
 				if a.Value != b.Value {
 					t.Errorf("spliced zone versions: a=%s b=%s", a.Value, b.Value)
@@ -224,4 +224,3 @@ func TestParentChildSourceAndRestart(t *testing.T) {
 		t.Fatalf("zone restore wrong: %+v %v", res3, err)
 	}
 }
-

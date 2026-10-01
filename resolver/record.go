@@ -31,4 +31,3 @@ type Source struct {
 }
 
 func (s Source) String() string { return fmt.Sprintf("%s@v%d", s.Zone, s.Version) }
-

@@ -100,3 +100,27 @@ func (c *Cache) Restore(entries []CacheEntry) {
 	}
 }
 
+// InvalidateWhere removes every entry matching pred. Used when a new view
+// is published: entries sourced from changed or removed zones (including
+// negative results) must not outlive the rules that produced them.
+func (c *Cache) InvalidateWhere(pred func(*CacheEntry) bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, e := range c.entries {
+		if pred(e) {
+			delete(c.entries, k)
+		}
+	}
+}
+
+// Entries returns a snapshot of all entries, live or expired (for
+// dry-run inspection).
+func (c *Cache) Entries() []CacheEntry {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]CacheEntry, 0, len(c.entries))
+	for _, e := range c.entries {
+		out = append(out, *e)
+	}
+	return out
+}

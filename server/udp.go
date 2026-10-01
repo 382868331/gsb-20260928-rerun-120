@@ -6,6 +6,7 @@ package server
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"localdns/resolver"
@@ -13,7 +14,10 @@ import (
 
 // Server answers line-based queries over UDP:
 //
-//	REQUEST:  "QUERY <name>"
+//	QUERY <name>            resolve against the current view
+//	QUERYAT <view> <name>   resolve against a retained historical view
+//	VIEWS                   list the recorded view history
+//
 //	RESPONSE: "OK <name> A <value> ..." | "CNAME <target> ..." | "ERR <code> <detail>"
 type Server struct {
 	core *resolver.Resolver
@@ -51,10 +55,37 @@ func (s *Server) Serve() error {
 
 func (s *Server) handle(q string) string {
 	parts := strings.Fields(q)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "QUERY") {
-		return "ERR BADREQUEST want: QUERY <name>"
+	if len(parts) == 0 {
+		return "ERR BADREQUEST want: QUERY <name> | QUERYAT <view> <name> | VIEWS"
 	}
-	res, err := s.core.Resolve(parts[1])
+	switch {
+	case len(parts) == 1 && strings.EqualFold(parts[0], "VIEWS"):
+		var b strings.Builder
+		for _, v := range s.core.History() {
+			fmt.Fprintf(&b, "VIEW %s; ", v)
+		}
+		fmt.Fprintf(&b, "current=%d", s.core.CurrentViewID())
+		return b.String()
+
+	case len(parts) == 2 && strings.EqualFold(parts[0], "QUERY"):
+		return s.answer(parts[1], func(name string) (*resolver.Result, error) {
+			return s.core.Resolve(name)
+		})
+
+	case len(parts) == 3 && strings.EqualFold(parts[0], "QUERYAT"):
+		id, err := strconv.ParseUint(parts[1], 10, 64)
+		if err != nil {
+			return "ERR BADREQUEST view must be a number"
+		}
+		return s.answer(parts[2], func(name string) (*resolver.Result, error) {
+			return s.core.ResolveInView(id, name)
+		})
+	}
+	return "ERR BADREQUEST want: QUERY <name> | QUERYAT <view> <name> | VIEWS"
+}
+
+func (s *Server) answer(name string, resolve func(string) (*resolver.Result, error)) string {
+	res, err := resolve(name)
 	if err != nil {
 		if re, ok := err.(*resolver.ResolveError); ok {
 			return "ERR " + re.Code + " " + re.Error()
@@ -68,7 +99,6 @@ func (s *Server) handle(q string) string {
 	for _, a := range res.Records {
 		fmt.Fprintf(&b, "OK %s A %s; ", a.Name, a.Value)
 	}
-	fmt.Fprintf(&b, "source=%s cache=%t", res.Source, res.FromCache)
+	fmt.Fprintf(&b, "source=%s view=%d cache=%t", res.Source, res.View, res.FromCache)
 	return b.String()
 }
-

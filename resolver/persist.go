@@ -8,13 +8,15 @@ import (
 // Snapshot is the durable state of the resolver: zone versions plus the
 // live cache. Written atomically (temp file + rename).
 type Snapshot struct {
-	Zones []Zone        `json:"zones"`
-	Cache []CacheEntry  `json:"cache"`
+	ViewID  uint64       `json:"view_id"`
+	Zones   []Zone       `json:"zones"`
+	Cache   []CacheEntry `json:"cache"`
+	History []ViewRecord `json:"history,omitempty"`
 }
 
 // SaveSnapshot persists zones and live cache entries to path.
 func (r *Resolver) SaveSnapshot(path string) error {
-	snap := Snapshot{Cache: r.cache.Snapshot()}
+	snap := Snapshot{ViewID: r.CurrentViewID(), Cache: r.cache.Snapshot(), History: r.History()}
 	for _, name := range r.ZoneNames() {
 		snap.Zones = append(snap.Zones, *r.ZoneSnapshot(name))
 	}
@@ -43,11 +45,17 @@ func LoadSnapshot(path string) (*Resolver, error) {
 	}
 	cache := NewCache()
 	r := NewResolver(cache)
+	zones := make(map[string]*Zone, len(snap.Zones))
 	for i := range snap.Zones {
 		z := snap.Zones[i]
-		r.AddZone(&z)
+		zones[z.Name] = &z
 	}
+	// Restore the exact saved view (same ID) without synthesizing history;
+	// the persisted history already explains which zone set answered what.
+	v := &zoneView{ID: snap.ViewID, Zones: zones}
+	r.view.Store(v)
+	r.views[v.ID] = v
+	r.history = append(r.history, snap.History...)
 	cache.Restore(snap.Cache)
 	return r, nil
 }
-
