@@ -32,3 +32,29 @@ func TestUDPAdapterUsesSharedCore(t *testing.T) {
 	}
 }
 
+func TestQueryAtHistoricalView(t *testing.T) {
+	core := resolver.NewResolver(resolver.NewCache())
+	core.AddZone(resolver.NewZone("example.test", 1, 60, []resolver.Record{
+		{Name: "www.example.test", Type: resolver.TypeA, Value: "10.0.0.1", TTL: 300},
+	}))
+	if err := core.UpdateZone(resolver.NewZone("example.test", 2, 60, []resolver.Record{
+		{Name: "www.example.test", Type: resolver.TypeA, Value: "10.0.0.2", TTL: 300},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{core: core}
+
+	if got := srv.handle("QUERY www.example.test"); !strings.Contains(got, "A 10.0.0.2") {
+		t.Fatalf("live query wrong: %s", got)
+	}
+	got := srv.handle("QUERYAT www.example.test example.test@1")
+	if !strings.Contains(got, "A 10.0.0.1") || !strings.Contains(got, "source=example.test@v1") {
+		t.Fatalf("historical query wrong: %s", got)
+	}
+	if got := srv.handle("QUERYAT www.example.test example.test@9"); !strings.Contains(got, "ERR") {
+		t.Fatalf("unknown version should fail: %s", got)
+	}
+	if got := srv.handle("QUERYAT www.example.test bogus"); !strings.Contains(got, "ERR BADREQUEST") {
+		t.Fatalf("bad pin should fail: %s", got)
+	}
+}

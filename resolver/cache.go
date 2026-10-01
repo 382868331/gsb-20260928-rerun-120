@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -72,6 +73,59 @@ func (c *Cache) Put(e *CacheEntry) bool {
 	return true
 }
 
+// staleKeys lists keys of entries whose source zone moved past their
+// recorded version: the answer (positive or negative) was valid for the
+// zone version it came from, and must not be served once the zone has
+// changed. With allVersions=false, entries from version >= fromVersion
+// are still valid; with allVersions=true every entry from the zone is
+// stale (zone removed).
+func (c *Cache) staleKeys(zone string, fromVersion uint64, allVersions bool) []string {
+	var keys []string
+	for k, e := range c.entries {
+		if e.Source.Zone != zone {
+			continue
+		}
+		if allVersions || e.Source.Version < fromVersion {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// StaleKeys reports which live entries would be invalidated if zone
+// advanced to fromVersion (used by batch preview; does not mutate).
+func (c *Cache) StaleKeys(zone string, fromVersion uint64) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.staleKeys(zone, fromVersion, false)
+}
+
+// InvalidateZone drops every entry sourced from zone at a version older
+// than fromVersion. Called when a zone version is published so superseded
+// answers — including negative ones — stop being returned immediately,
+// instead of lingering until their TTL expires. Returns the removed keys.
+func (c *Cache) InvalidateZone(zone string, fromVersion uint64) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	keys := c.staleKeys(zone, fromVersion, false)
+	for _, k := range keys {
+		delete(c.entries, k)
+	}
+	return keys
+}
+
+// InvalidateZoneAll drops every entry sourced from zone (zone removed).
+func (c *Cache) InvalidateZoneAll(zone string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	keys := c.staleKeys(zone, 0, true)
+	for _, k := range keys {
+		delete(c.entries, k)
+	}
+	return keys
+}
+
 // Snapshot returns all live entries (for persistence).
 func (c *Cache) Snapshot() []CacheEntry {
 	c.mu.RLock()
@@ -99,4 +153,3 @@ func (c *Cache) Restore(entries []CacheEntry) {
 		}
 	}
 }
-

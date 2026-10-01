@@ -3,13 +3,16 @@ package resolver
 import (
 	"encoding/json"
 	"os"
+	"sort"
 )
 
-// Snapshot is the durable state of the resolver: zone versions plus the
-// live cache. Written atomically (temp file + rename).
+// Snapshot is the durable state of the resolver: current zone versions,
+// the full version history (so historical answers stay explainable after
+// a restart), and the live cache. Written atomically (temp file + rename).
 type Snapshot struct {
-	Zones []Zone        `json:"zones"`
-	Cache []CacheEntry  `json:"cache"`
+	Zones   []Zone       `json:"zones"`
+	History []Zone       `json:"history,omitempty"`
+	Cache   []CacheEntry `json:"cache"`
 }
 
 // SaveSnapshot persists zones and live cache entries to path.
@@ -18,6 +21,13 @@ func (r *Resolver) SaveSnapshot(path string) error {
 	for _, name := range r.ZoneNames() {
 		snap.Zones = append(snap.Zones, *r.ZoneSnapshot(name))
 	}
+	r.mu.RLock()
+	for _, versions := range r.hist {
+		for _, z := range versions {
+			snap.History = append(snap.History, *z)
+		}
+	}
+	r.mu.RUnlock()
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
 		return err
@@ -47,7 +57,23 @@ func LoadSnapshot(path string) (*Resolver, error) {
 		z := snap.Zones[i]
 		r.AddZone(&z)
 	}
+	// Restore version history so ResolveAt can explain past answers.
+	// Snapshots written before history existed fall back to the current
+	// versions already registered by AddZone.
+	if len(snap.History) > 0 {
+		r.mu.Lock()
+		r.hist = make(map[string][]*Zone)
+		for i := range snap.History {
+			z := snap.History[i]
+			r.hist[z.Name] = append(r.hist[z.Name], &z)
+		}
+		for name := range r.hist {
+			sort.Slice(r.hist[name], func(i, j int) bool {
+				return r.hist[name][i].Version < r.hist[name][j].Version
+			})
+		}
+		r.mu.Unlock()
+	}
 	cache.Restore(snap.Cache)
 	return r, nil
 }
-

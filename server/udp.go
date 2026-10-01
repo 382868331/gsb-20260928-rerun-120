@@ -6,6 +6,7 @@ package server
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"localdns/resolver"
@@ -13,8 +14,12 @@ import (
 
 // Server answers line-based queries over UDP:
 //
-//	REQUEST:  "QUERY <name>"
+//	REQUEST:  "QUERY <name>" | "QUERYAT <name> <zone@version,...>"
 //	RESPONSE: "OK <name> A <value> ..." | "CNAME <target> ..." | "ERR <code> <detail>"
+//
+// QUERYAT resolves against a historical view: each listed zone is pinned
+// to the given version, so a past answer can be reproduced and attributed
+// to the zone set that produced it.
 type Server struct {
 	core *resolver.Resolver
 	conn *net.UDPConn
@@ -51,10 +56,27 @@ func (s *Server) Serve() error {
 
 func (s *Server) handle(q string) string {
 	parts := strings.Fields(q)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "QUERY") {
-		return "ERR BADREQUEST want: QUERY <name>"
+	if len(parts) == 2 && strings.EqualFold(parts[0], "QUERY") {
+		return s.answer(parts[1], nil)
 	}
-	res, err := s.core.Resolve(parts[1])
+	if len(parts) == 3 && strings.EqualFold(parts[0], "QUERYAT") {
+		pin, err := parsePin(parts[2])
+		if err != nil {
+			return "ERR BADREQUEST " + err.Error()
+		}
+		return s.answer(parts[1], pin)
+	}
+	return "ERR BADREQUEST want: QUERY <name> | QUERYAT <name> <zone@version,...>"
+}
+
+func (s *Server) answer(name string, pin map[string]uint64) string {
+	var res *resolver.Result
+	var err error
+	if pin == nil {
+		res, err = s.core.Resolve(name)
+	} else {
+		res, err = s.core.ResolveAt(name, pin)
+	}
 	if err != nil {
 		if re, ok := err.(*resolver.ResolveError); ok {
 			return "ERR " + re.Code + " " + re.Error()
@@ -72,3 +94,19 @@ func (s *Server) handle(q string) string {
 	return b.String()
 }
 
+// parsePin parses "zone@version,zone@version" into a pin map.
+func parsePin(s string) (map[string]uint64, error) {
+	pin := make(map[string]uint64)
+	for _, part := range strings.Split(s, ",") {
+		zn, vs, ok := strings.Cut(part, "@")
+		if !ok {
+			return nil, fmt.Errorf("bad pin %q, want zone@version", part)
+		}
+		v, err := strconv.ParseUint(vs, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("bad version in %q", part)
+		}
+		pin[resolver.NormalizeName(zn)] = v
+	}
+	return pin, nil
+}
