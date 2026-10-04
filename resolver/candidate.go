@@ -103,14 +103,33 @@ func (r *Resolver) Candidate(id string) *Candidate {
 // seen at their base version here — never spliced with the candidate
 // zones from a different point in time.
 func (r *Resolver) candidateView(c *Candidate) zoneView {
-	return func(name string) *Zone {
-		if z, ok := c.Zones[name]; ok {
-			return z
-		}
-		if v, ok := c.Base[name]; ok {
-			return r.ZoneVersion(name, v)
-		}
-		return nil
+	return zoneView{
+		get: func(name string) *Zone {
+			if z, ok := c.Zones[name]; ok {
+				return z
+			}
+			if v, ok := c.Base[name]; ok {
+				return r.ZoneVersion(name, v)
+			}
+			return nil
+		},
+		// The candidate's zone set is its own: zones it carries plus every
+		// zone the pinned base knows about. A zone that exists only in the
+		// candidate (not yet in the live catalog) is authoritative inside
+		// this view, so queries for it resolve here instead of NOZONE.
+		names: func() []string {
+			names := r.histZoneNames()
+			seen := make(map[string]bool, len(names))
+			for _, n := range names {
+				seen[n] = true
+			}
+			for zn := range c.Zones {
+				if !seen[zn] {
+					names = append(names, zn)
+				}
+			}
+			return names
+		},
 	}
 }
 
@@ -138,9 +157,6 @@ func (r *Resolver) StaleDeps(id string) ([]StaleDep, error) {
 	defer r.mu.RUnlock()
 	var stale []StaleDep
 	for zone, baseV := range c.Base {
-		if _, overridden := c.Zones[zone]; overridden {
-			continue // candidate carries its own version of this zone
-		}
 		s, ok := r.zones[zone]
 		if !ok {
 			stale = append(stale, StaleDep{Zone: zone, BaseVersion: baseV, Removed: true})

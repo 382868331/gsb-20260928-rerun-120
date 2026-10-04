@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -309,5 +310,148 @@ func TestCandidateValidation(t *testing.T) {
 	}
 	if _, err := r.ResolveCandidate("nope", "www.example.test"); err == nil {
 		t.Fatal("unknown candidate resolved")
+	}
+}
+
+// A candidate may introduce a zone that does not exist in the live
+// catalog at all. Queries for it must resolve inside the candidate view
+// (not NOZONE), cross-zone aliases and negative results must stay inside
+// that view, and the conclusions must survive a snapshot/restart.
+func TestCandidateWithZoneUnknownToLiveCatalog(t *testing.T) {
+	// No root zone here: the candidate's new zone is outside every live
+	// zone, so the live view has no authoritative source for it at all.
+	r := NewResolver(NewCache())
+	r.AddZone(NewZone("example.test", 1, 60, []Record{
+		{Name: "www.example.test", Type: TypeA, Value: "10.0.0.1", TTL: 300},
+	}))
+	if _, err := r.NewCandidate("lab", []*Zone{
+		NewZone("example.test", 2, 60, []Record{
+			{Name: "www.example.test", Type: TypeA, Value: "10.0.0.1", TTL: 300},
+			{Name: "alias.example.test", Type: TypeCNAME, Value: "host.lab.test", TTL: 300},
+		}),
+		NewZone("lab.test", 1, 60, []Record{
+			{Name: "host.lab.test", Type: TypeA, Value: "10.7.7.7", TTL: 300},
+		}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The new zone resolves inside the candidate view only.
+	res, err := r.ResolveCandidate("lab", "host.lab.test")
+	if err != nil || res.Records[0].Value != "10.7.7.7" ||
+		res.View != "candidate:lab" || res.Source.String() != "lab.test@v1" {
+		t.Fatalf("candidate new-zone answer: %+v %v", res, err)
+	}
+	if _, err := r.Resolve("host.lab.test"); err == nil ||
+		err.(*ResolveError).Code != ErrNoZone {
+		t.Fatalf("live view must not see candidate-only zone: %v", err)
+	}
+
+	// Cross-zone alias: candidate example.test -> candidate lab.test.
+	res, err = r.ResolveCandidate("lab", "alias.example.test")
+	if err != nil || res.Records[0].Value != "10.7.7.7" || len(res.Chain) != 1 {
+		t.Fatalf("cross-zone alias in candidate: %+v %v", res, err)
+	}
+
+	// Negative answer stays in the candidate's private cache.
+	if _, err := r.ResolveCandidate("lab", "ghost.lab.test"); err == nil ||
+		err.(*ResolveError).Code != ErrNXDOMAIN {
+		t.Fatalf("want NXDOMAIN in candidate, got %v", err)
+	}
+	found := false
+	for _, e := range r.Candidate("lab").cache.Snapshot() {
+		if e.Name == "ghost.lab.test" && e.Negative && e.View == "candidate:lab" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("candidate negative answer not in candidate cache")
+	}
+	for _, e := range r.Cache().Snapshot() {
+		if e.Name == "ghost.lab.test" {
+			t.Fatal("candidate negative answer leaked into live cache")
+		}
+	}
+
+	// After a restart the same conclusions hold.
+	path := filepath.Join(t.TempDir(), "snap.json")
+	if err := r.SaveSnapshot(path); err != nil {
+		t.Fatal(err)
+	}
+	r2, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err = r2.ResolveCandidate("lab", "host.lab.test")
+	if err != nil || res.Records[0].Value != "10.7.7.7" {
+		t.Fatalf("candidate new-zone answer after reopen: %+v %v", res, err)
+	}
+	if _, err := r2.Resolve("host.lab.test"); err == nil {
+		t.Fatal("live view sees candidate-only zone after reopen")
+	}
+}
+
+// When a live zone changes, StaleDeps must report the moved base even for
+// a zone the candidate overrides — adoption-time version conflicts must
+// not be the first notice.
+func TestStaleDepsReportOverriddenZone(t *testing.T) {
+	r := buildTree()
+	if _, err := r.NewCandidate("cand", []*Zone{
+		NewZone("example.test", 3, 60, []Record{
+			{Name: "www.example.test", Type: TypeA, Value: "10.0.0.9", TTL: 300},
+		}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if stale, _ := r.StaleDeps("cand"); len(stale) != 0 {
+		t.Fatalf("fresh candidate should have no stale deps: %+v", stale)
+	}
+
+	// Live moves the very zone the candidate overrides.
+	if err := r.UpdateZone(NewZone("example.test", 2, 60, []Record{
+		{Name: "www.example.test", Type: TypeA, Value: "10.0.0.5", TTL: 300},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := r.StaleDeps("cand")
+	if err != nil || len(stale) != 1 || stale[0].Zone != "example.test" ||
+		stale[0].BaseVersion != 1 || stale[0].CurrentVersion != 2 {
+		t.Fatalf("overridden zone must be reported stale: %+v %v", stale, err)
+	}
+	if _, err := r.AdoptCandidate("cand"); err == nil ||
+		!strings.Contains(err.Error(), "stale") {
+		t.Fatalf("adopt with stale deps must fail: %v", err)
+	}
+
+	// The stale conclusion survives a restart.
+	path := filepath.Join(t.TempDir(), "snap.json")
+	if err := r.SaveSnapshot(path); err != nil {
+		t.Fatal(err)
+	}
+	r2, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err = r2.StaleDeps("cand")
+	if err != nil || len(stale) != 1 || stale[0].Zone != "example.test" {
+		t.Fatalf("stale deps after reopen: %+v %v", stale, err)
+	}
+
+	// Recheck re-pins the base; adoption then succeeds and records the
+	// basis it actually rested on.
+	moved, err := r2.RecheckCandidate("cand")
+	if err != nil || len(moved) != 1 || moved[0].Zone != "example.test" {
+		t.Fatalf("recheck: %+v %v", moved, err)
+	}
+	ad, err := r2.AdoptCandidate("cand")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ad.Basis["example.test"] != 2 || ad.Zones["example.test"] != 3 {
+		t.Fatalf("adoption basis wrong: %+v", ad)
+	}
+	res, err := r2.Resolve("www.example.test")
+	if err != nil || res.Records[0].Value != "10.0.0.9" {
+		t.Fatalf("adopted answer: %+v %v", res, err)
 	}
 }
