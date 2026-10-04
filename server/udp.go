@@ -14,12 +14,17 @@ import (
 
 // Server answers line-based queries over UDP:
 //
-//	REQUEST:  "QUERY <name>" | "QUERYAT <name> <zone@version,...>"
+//	REQUEST:  "QUERY <name>" | "QUERYAT <name> <zone@version,...>" |
+//	          "CQUERY <candidate> <name>" | "CCMP <candidate> <name>"
 //	RESPONSE: "OK <name> A <value> ..." | "CNAME <target> ..." | "ERR <code> <detail>"
 //
 // QUERYAT resolves against a historical view: each listed zone is pinned
 // to the given version, so a past answer can be reproduced and attributed
 // to the zone set that produced it.
+//
+// CQUERY resolves against an isolated candidate view; CCMP runs the same
+// query against the live view and the candidate view and reports both
+// outcomes side by side.
 type Server struct {
 	core *resolver.Resolver
 	conn *net.UDPConn
@@ -66,7 +71,24 @@ func (s *Server) handle(q string) string {
 		}
 		return s.answer(parts[1], pin)
 	}
-	return "ERR BADREQUEST want: QUERY <name> | QUERYAT <name> <zone@version,...>"
+	if len(parts) == 3 && strings.EqualFold(parts[0], "CQUERY") {
+		res, err := s.core.ResolveCandidate(parts[1], parts[2])
+		if err != nil {
+			return errString(err)
+		}
+		return okString(res)
+	}
+	if len(parts) == 3 && strings.EqualFold(parts[0], "CCMP") {
+		cmp, err := s.core.CompareQuery(parts[1], parts[2])
+		if err != nil {
+			return errString(err)
+		}
+		return fmt.Sprintf("LIVE %s | CANDIDATE %s | DIFFERS %t",
+			sideString(cmp.Live, cmp.LiveErr),
+			sideString(cmp.Candidate, cmp.CandidateErr),
+			cmp.Differs)
+	}
+	return "ERR BADREQUEST want: QUERY <name> | QUERYAT <name> <zone@version,...> | CQUERY <candidate> <name> | CCMP <candidate> <name>"
 }
 
 func (s *Server) answer(name string, pin map[string]uint64) string {
@@ -78,11 +100,19 @@ func (s *Server) answer(name string, pin map[string]uint64) string {
 		res, err = s.core.ResolveAt(name, pin)
 	}
 	if err != nil {
-		if re, ok := err.(*resolver.ResolveError); ok {
-			return "ERR " + re.Code + " " + re.Error()
-		}
-		return "ERR INTERNAL " + err.Error()
+		return errString(err)
 	}
+	return okString(res)
+}
+
+func errString(err error) string {
+	if re, ok := err.(*resolver.ResolveError); ok {
+		return "ERR " + re.Code + " " + re.Error()
+	}
+	return "ERR INTERNAL " + err.Error()
+}
+
+func okString(res *resolver.Result) string {
 	var b strings.Builder
 	for _, c := range res.Chain {
 		fmt.Fprintf(&b, "CNAME %s %s; ", c.Name, c.Value)
@@ -91,7 +121,17 @@ func (s *Server) answer(name string, pin map[string]uint64) string {
 		fmt.Fprintf(&b, "OK %s A %s; ", a.Name, a.Value)
 	}
 	fmt.Fprintf(&b, "source=%s cache=%t", res.Source, res.FromCache)
+	if res.View != "" {
+		fmt.Fprintf(&b, " view=%s", res.View)
+	}
 	return b.String()
+}
+
+func sideString(res *resolver.Result, errCode string) string {
+	if errCode != "" {
+		return "ERR " + errCode
+	}
+	return okString(res)
 }
 
 // parsePin parses "zone@version,zone@version" into a pin map.

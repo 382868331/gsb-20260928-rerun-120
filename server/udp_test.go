@@ -58,3 +58,36 @@ func TestQueryAtHistoricalView(t *testing.T) {
 		t.Fatalf("bad pin should fail: %s", got)
 	}
 }
+
+func TestCandidateQueryAndCompare(t *testing.T) {
+	core := resolver.NewResolver(resolver.NewCache())
+	core.AddZone(resolver.NewZone("example.test", 1, 60, []resolver.Record{
+		{Name: "www.example.test", Type: resolver.TypeA, Value: "10.0.0.1", TTL: 300},
+	}))
+	if _, err := core.OpenCandidate("c1", []*resolver.Zone{
+		resolver.NewZone("example.test", 2, 60, []resolver.Record{
+			{Name: "www.example.test", Type: resolver.TypeA, Value: "10.0.0.2", TTL: 300},
+		}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{core: core}
+
+	got := srv.handle("CQUERY c1 www.example.test")
+	if !strings.Contains(got, "A 10.0.0.2") || !strings.Contains(got, "view=candidate:c1") {
+		t.Fatalf("bad candidate response: %s", got)
+	}
+	got = srv.handle("CCMP c1 www.example.test")
+	if !strings.Contains(got, "LIVE OK www.example.test A 10.0.0.1") ||
+		!strings.Contains(got, "CANDIDATE OK www.example.test A 10.0.0.2") ||
+		!strings.Contains(got, "DIFFERS true") {
+		t.Fatalf("bad comparison response: %s", got)
+	}
+	// The candidate view did not disturb the live answer.
+	if got := srv.handle("QUERY www.example.test"); !strings.Contains(got, "A 10.0.0.1") {
+		t.Fatalf("live answer disturbed: %s", got)
+	}
+	if got := srv.handle("CQUERY nope www.example.test"); !strings.Contains(got, "ERR") {
+		t.Fatalf("unknown candidate should fail: %s", got)
+	}
+}

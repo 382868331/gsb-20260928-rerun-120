@@ -10,9 +10,10 @@ import (
 // the full version history (so historical answers stay explainable after
 // a restart), and the live cache. Written atomically (temp file + rename).
 type Snapshot struct {
-	Zones   []Zone       `json:"zones"`
-	History []Zone       `json:"history,omitempty"`
-	Cache   []CacheEntry `json:"cache"`
+	Zones      []Zone       `json:"zones"`
+	History    []Zone       `json:"history,omitempty"`
+	Cache      []CacheEntry `json:"cache"`
+	Candidates []Candidate  `json:"candidates,omitempty"`
 }
 
 // SaveSnapshot persists zones and live cache entries to path.
@@ -26,6 +27,9 @@ func (r *Resolver) SaveSnapshot(path string) error {
 		for _, z := range versions {
 			snap.History = append(snap.History, *z)
 		}
+	}
+	for _, c := range r.candidates {
+		snap.Candidates = append(snap.Candidates, *c)
 	}
 	r.mu.RUnlock()
 	data, err := json.MarshalIndent(snap, "", "  ")
@@ -75,5 +79,9 @@ func LoadSnapshot(path string) (*Resolver, error) {
 		r.mu.Unlock()
 	}
 	cache.Restore(snap.Cache)
+	for i := range snap.Candidates {
+		c := snap.Candidates[i]
+		r.candidates[c.ID] = &c
+	}
 	return r, nil
 }
