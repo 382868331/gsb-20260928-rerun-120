@@ -13,6 +13,7 @@ type CacheEntry struct {
 	Type     RecordType `json:"type"`
 	Records  []Record   `json:"records,omitempty"`
 	Negative bool       `json:"negative"` // true: cached NXDOMAIN/NODATA
+	View     string     `json:"view"`     // which query view produced this entry
 	Source   Source     `json:"source"`
 	Expires  time.Time  `json:"expires"`
 }

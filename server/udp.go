@@ -15,11 +15,16 @@ import (
 // Server answers line-based queries over UDP:
 //
 //	REQUEST:  "QUERY <name>" | "QUERYAT <name> <zone@version,...>"
+//	          | "CANDQUERY <candidate-id> <name>" | "COMPARE <candidate-id> <name>"
 //	RESPONSE: "OK <name> A <value> ..." | "CNAME <target> ..." | "ERR <code> <detail>"
 //
 // QUERYAT resolves against a historical view: each listed zone is pinned
 // to the given version, so a past answer can be reproduced and attributed
 // to the zone set that produced it.
+//
+// CANDQUERY resolves inside an isolated candidate view; COMPARE runs the
+// same query against the live view and the candidate and reports both
+// outcomes side by side.
 type Server struct {
 	core *resolver.Resolver
 	conn *net.UDPConn
@@ -66,7 +71,22 @@ func (s *Server) handle(q string) string {
 		}
 		return s.answer(parts[1], pin)
 	}
-	return "ERR BADREQUEST want: QUERY <name> | QUERYAT <name> <zone@version,...>"
+	if len(parts) == 3 && strings.EqualFold(parts[0], "CANDQUERY") {
+		res, err := s.core.ResolveCandidate(parts[1], parts[2])
+		if err != nil {
+			if re, ok := err.(*resolver.ResolveError); ok {
+				return "ERR " + re.Code + " " + re.Error()
+			}
+			return "ERR INTERNAL " + err.Error()
+		}
+		return formatResult(res)
+	}
+	if len(parts) == 3 && strings.EqualFold(parts[0], "COMPARE") {
+		cmp := s.core.Compare(parts[1], parts[2])
+		return fmt.Sprintf("live=[%s] candidate=[%s] changed=%t",
+			outcome(cmp.Live, cmp.LiveErr), outcome(cmp.Candidate, cmp.CandErr), cmp.Changed())
+	}
+	return "ERR BADREQUEST want: QUERY <name> | QUERYAT <name> <zone@version,...> | CANDQUERY <id> <name> | COMPARE <id> <name>"
 }
 
 func (s *Server) answer(name string, pin map[string]uint64) string {
@@ -83,6 +103,10 @@ func (s *Server) answer(name string, pin map[string]uint64) string {
 		}
 		return "ERR INTERNAL " + err.Error()
 	}
+	return formatResult(res)
+}
+
+func formatResult(res *resolver.Result) string {
 	var b strings.Builder
 	for _, c := range res.Chain {
 		fmt.Fprintf(&b, "CNAME %s %s; ", c.Name, c.Value)
@@ -90,8 +114,15 @@ func (s *Server) answer(name string, pin map[string]uint64) string {
 	for _, a := range res.Records {
 		fmt.Fprintf(&b, "OK %s A %s; ", a.Name, a.Value)
 	}
-	fmt.Fprintf(&b, "source=%s cache=%t", res.Source, res.FromCache)
+	fmt.Fprintf(&b, "view=%s source=%s cache=%t", res.View, res.Source, res.FromCache)
 	return b.String()
+}
+
+func outcome(res *resolver.Result, errStr string) string {
+	if errStr != "" {
+		return "ERR " + errStr
+	}
+	return formatResult(res)
 }
 
 // parsePin parses "zone@version,zone@version" into a pin map.

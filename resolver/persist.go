@@ -10,9 +10,21 @@ import (
 // the full version history (so historical answers stay explainable after
 // a restart), and the live cache. Written atomically (temp file + rename).
 type Snapshot struct {
-	Zones   []Zone       `json:"zones"`
-	History []Zone       `json:"history,omitempty"`
-	Cache   []CacheEntry `json:"cache"`
+	Zones      []Zone              `json:"zones"`
+	History    []Zone              `json:"history,omitempty"`
+	Cache      []CacheEntry        `json:"cache"`
+	Candidates []CandidateSnapshot `json:"candidates,omitempty"`
+	Adopted    []Adoption          `json:"adopted,omitempty"`
+	Abandoned  []Abandonment       `json:"abandoned,omitempty"`
+}
+
+// CandidateSnapshot is the durable form of a candidate view. The
+// candidate's private cache is not persisted: after a restart the view
+// re-derives its answers from the same pinned zone set.
+type CandidateSnapshot struct {
+	ID    string            `json:"id"`
+	Zones []Zone            `json:"zones"`
+	Base  map[string]uint64 `json:"base"`
 }
 
 // SaveSnapshot persists zones and live cache entries to path.
@@ -27,6 +39,15 @@ func (r *Resolver) SaveSnapshot(path string) error {
 			snap.History = append(snap.History, *z)
 		}
 	}
+	for _, c := range r.cands {
+		cs := CandidateSnapshot{ID: c.ID, Base: c.Base}
+		for _, z := range c.Zones {
+			cs.Zones = append(cs.Zones, *z)
+		}
+		snap.Candidates = append(snap.Candidates, cs)
+	}
+	snap.Adopted = r.adopted
+	snap.Abandoned = r.abandoned
 	r.mu.RUnlock()
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
@@ -75,5 +96,21 @@ func LoadSnapshot(path string) (*Resolver, error) {
 		r.mu.Unlock()
 	}
 	cache.Restore(snap.Cache)
+	for i := range snap.Candidates {
+		cs := snap.Candidates[i]
+		c := &Candidate{
+			ID:    cs.ID,
+			Zones: make(map[string]*Zone),
+			Base:  cs.Base,
+			cache: NewCache(),
+		}
+		for j := range cs.Zones {
+			z := cs.Zones[j]
+			c.Zones[z.Name] = &z
+		}
+		r.cands[cs.ID] = c
+	}
+	r.adopted = snap.Adopted
+	r.abandoned = snap.Abandoned
 	return r, nil
 }

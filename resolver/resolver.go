@@ -34,6 +34,7 @@ type Result struct {
 	Name      string
 	Records   []Record // final A records
 	Chain     []Record // CNAME chain followed, in order
+	View      string   // query view that produced this answer
 	Source    Source
 	FromCache bool
 }
@@ -50,6 +51,10 @@ type Resolver struct {
 
 	mu   sync.RWMutex
 	hist map[string][]*Zone // zone name -> versions, ascending
+
+	cands     map[string]*Candidate // isolated candidate query views
+	adopted   []Adoption            // log of adopted candidates and their basis
+	abandoned []Abandonment         // log of abandoned candidates and their diffs
 }
 
 func NewResolver(cache *Cache) *Resolver {
@@ -57,6 +62,7 @@ func NewResolver(cache *Cache) *Resolver {
 		zones: make(map[string]*ZoneStore),
 		cache: cache,
 		hist:  make(map[string][]*Zone),
+		cands: make(map[string]*Candidate),
 	}
 }
 
@@ -256,7 +262,7 @@ func (r *Resolver) authoritativeZone(qname string, view zoneView) (*Zone, error)
 // Resolve answers an A-type query for name, chasing aliases. All records
 // used for one delegation step come from a single zone snapshot.
 func (r *Resolver) Resolve(name string) (*Result, error) {
-	return r.resolve(name, nil, r.liveView(), true)
+	return r.resolve(name, nil, r.liveView(), r.cache, "live")
 }
 
 // ResolveAt answers a query against a historical view: each zone named in
@@ -270,10 +276,10 @@ func (r *Resolver) ResolveAt(name string, pin map[string]uint64) (*Result, error
 			return nil, &ResolveError{Code: ErrNoZone}
 		}
 	}
-	return r.resolve(name, nil, r.pinnedView(pin), false)
+	return r.resolve(name, nil, r.pinnedView(pin), nil, "pinned")
 }
 
-func (r *Resolver) resolve(name string, chain []Record, view zoneView, useCache bool) (*Result, error) {
+func (r *Resolver) resolve(name string, chain []Record, view zoneView, cache *Cache, viewName string) (*Result, error) {
 	name = NormalizeName(name)
 	// Loop detection: name already visited in this chain. Build the full
 	// alias path first so the error reports the entire cycle.
@@ -290,12 +296,12 @@ func (r *Resolver) resolve(name string, chain []Record, view zoneView, useCache 
 		return nil, &ResolveError{Code: ErrLoop, Path: path}
 	}
 
-	if useCache {
-		if e := r.cache.Get(name, TypeA); e != nil {
+	if cache != nil {
+		if e := cache.Get(name, TypeA); e != nil {
 			if e.Negative {
 				return nil, &ResolveError{Code: ErrNXDOMAIN, Path: path}
 			}
-			return &Result{Name: name, Records: e.Records, Source: e.Source, FromCache: true}, nil
+			return &Result{Name: name, Records: e.Records, View: viewName, Source: e.Source, FromCache: true}, nil
 		}
 	}
 
@@ -318,17 +324,18 @@ func (r *Resolver) resolve(name string, chain []Record, view zoneView, useCache 
 
 	switch {
 	case len(aRecs) > 0:
-		if useCache {
-			r.cache.Put(&CacheEntry{
+		if cache != nil {
+			cache.Put(&CacheEntry{
 				Name: name, Type: TypeA, Records: aRecs, Source: src,
-				Expires: r.cache.now().Add(time.Duration(minTTL(aRecs)) * time.Second),
+				View:    viewName,
+				Expires: cache.now().Add(time.Duration(minTTL(aRecs)) * time.Second),
 			})
 		}
-		return &Result{Name: name, Records: aRecs, Source: src}, nil
+		return &Result{Name: name, Records: aRecs, View: viewName, Source: src}, nil
 
 	case len(cnames) > 0:
 		cn := cnames[0]
-		sub, err := r.resolve(NormalizeName(cn.Value), append(chain, cn), view, useCache)
+		sub, err := r.resolve(NormalizeName(cn.Value), append(chain, cn), view, cache, viewName)
 		if err != nil {
 			return nil, err
 		}
@@ -342,10 +349,11 @@ func (r *Resolver) resolve(name string, chain []Record, view zoneView, useCache 
 		if zone.Name == name || len(recs) > 0 {
 			code = ErrNODATA
 		}
-		if useCache {
-			r.cache.Put(&CacheEntry{
+		if cache != nil {
+			cache.Put(&CacheEntry{
 				Name: name, Type: TypeA, Negative: true, Source: src,
-				Expires: r.cache.now().Add(time.Duration(zone.NegativeTTL) * time.Second),
+				View:    viewName,
+				Expires: cache.now().Add(time.Duration(zone.NegativeTTL) * time.Second),
 			})
 		}
 		return nil, &ResolveError{Code: code}

@@ -58,3 +58,35 @@ func TestQueryAtHistoricalView(t *testing.T) {
 		t.Fatalf("bad pin should fail: %s", got)
 	}
 }
+
+func TestCandidateCommands(t *testing.T) {
+	core := resolver.NewResolver(resolver.NewCache())
+	core.AddZone(resolver.NewZone("example.test", 1, 60, []resolver.Record{
+		{Name: "www.example.test", Type: resolver.TypeA, Value: "10.0.0.1", TTL: 300},
+	}))
+	if _, err := core.NewCandidate("v2", []*resolver.Zone{
+		resolver.NewZone("example.test", 2, 60, []resolver.Record{
+			{Name: "www.example.test", Type: resolver.TypeA, Value: "10.0.0.99", TTL: 300},
+		}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{core: core}
+
+	got := srv.handle("CANDQUERY v2 www.example.test")
+	if !strings.Contains(got, "A 10.0.0.99") || !strings.Contains(got, "view=candidate:v2") {
+		t.Fatalf("bad candidate response: %s", got)
+	}
+	got = srv.handle("COMPARE v2 www.example.test")
+	if !strings.Contains(got, "10.0.0.1") || !strings.Contains(got, "10.0.0.99") ||
+		!strings.Contains(got, "changed=true") {
+		t.Fatalf("bad compare response: %s", got)
+	}
+	if got := srv.handle("CANDQUERY nope www.example.test"); !strings.Contains(got, "ERR") {
+		t.Fatalf("unknown candidate should fail: %s", got)
+	}
+	// Live query still tagged as the live view.
+	if got := srv.handle("QUERY www.example.test"); !strings.Contains(got, "view=live") {
+		t.Fatalf("live query missing view tag: %s", got)
+	}
+}
