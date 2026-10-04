@@ -184,29 +184,63 @@ func (r *Resolver) ZoneSnapshot(name string) *Zone {
 	return nil
 }
 
-// zoneView resolves a zone name to the immutable snapshot to use.
-// The live view returns current versions; a pinned view (ResolveAt)
-// returns historical versions so a past answer can be reproduced and
-// explained.
-type zoneView func(name string) *Zone
+// zoneView is the authoritative zone set a query is answered from.
+// lookup returns the snapshot the view has for a zone name (nil when
+// the zone is not part of this view), and names enumerates every zone
+// name the view contains. Enumeration must come from the view itself —
+// never from the live directory — so a candidate carrying a brand-new
+// zone that the official directory does not know yet is still
+// authoritative inside that candidate view. Negatives, cross-zone
+// aliases and new zones all stay within the view that produced them.
+type zoneView struct {
+	lookup func(name string) *Zone
+	names  func() []string
+}
 
 func (r *Resolver) liveView() zoneView {
-	return func(name string) *Zone {
-		if s, ok := r.zones[name]; ok {
-			return s.Current()
+	return zoneView{
+		lookup: func(name string) *Zone {
+			if s, ok := r.zones[name]; ok {
+				return s.Current()
+			}
+			return nil
+		},
+		names: func() []string {
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+		names := make([]string, 0, len(r.zones))
+		for zn := range r.zones {
+			names = append(names, zn)
 		}
-		return nil
+		return names
+	},
 	}
 }
 
 // pinnedView returns a view of the zone set at the given versions.
 // Zones absent from pin are seen at their current version.
 func (r *Resolver) pinnedView(pin map[string]uint64) zoneView {
-	return func(name string) *Zone {
-		if v, ok := pin[name]; ok {
-			return r.ZoneVersion(name, v)
-		}
-		return r.liveView()(name)
+	live := r.liveView()
+	return zoneView{
+		lookup: func(name string) *Zone {
+			if v, ok := pin[name]; ok {
+				return r.ZoneVersion(name, v)
+			}
+			return live.lookup(name)
+		},
+		names: func() []string {
+			names := live.names()
+			seen := make(map[string]bool, len(names))
+			for _, n := range names {
+				seen[n] = true
+			}
+			for zn := range pin {
+				if !seen[zn] {
+					names = append(names, zn)
+				}
+			}
+			return names
+		},
 	}
 }
 
@@ -216,16 +250,11 @@ func (r *Resolver) pinnedView(pin map[string]uint64) zoneView {
 // below a delegation point in the parent zone are never consulted.
 func (r *Resolver) authoritativeZone(qname string, view zoneView) (*Zone, error) {
 	qname = NormalizeName(qname)
-	// candidate zones, shallowest first
 	var matches []*Zone
-	r.mu.RLock()
-	names := make([]string, 0, len(r.hist))
-	for zn := range r.hist { // history covers live and removed zones
-		names = append(names, zn)
-	}
-	r.mu.RUnlock()
-	for _, zn := range names {
-		if z := view(zn); z != nil && IsSubName(qname, zn) {
+	// Enumerate the zones the view itself contains; the live directory
+	// (and its history) is irrelevant here.
+	for _, zn := range view.names() {
+		if z := view.lookup(zn); z != nil && IsSubName(qname, zn) {
 			matches = append(matches, z)
 		}
 	}
@@ -246,7 +275,7 @@ func (r *Resolver) authoritativeZone(qname string, view zoneView) (*Zone, error)
 			}
 			for _, rec := range recs {
 				if rec.Type == TypeNS && len(owner) > len(best) {
-					if view(owner) != nil {
+					if view.lookup(owner) != nil {
 						best = owner
 					}
 				}
@@ -255,7 +284,7 @@ func (r *Resolver) authoritativeZone(qname string, view zoneView) (*Zone, error)
 		if best == "" || best == zone.Name {
 			return zone, nil
 		}
-		zone = view(best)
+		zone = view.lookup(best)
 	}
 }
 

@@ -311,3 +311,171 @@ func TestCandidateValidation(t *testing.T) {
 		t.Fatal("unknown candidate resolved")
 	}
 }
+
+// TestCandidateNewZoneNotInLiveDirectory covers a trial view that adds
+// a zone the official directory has never heard of. Queries inside the
+// candidate must find that zone from the candidate's own set — never
+// return NOZONE just because the live directory lacks a same-named zone.
+// Cross-zone aliases into the new zone and negative answers it produces
+// both stay inside the candidate view, and everything survives a reopen.
+func TestCandidateNewZoneNotInLiveDirectory(t *testing.T) {
+	r := buildTree()
+	id := "newzone"
+	if _, err := r.NewCandidate(id, []*Zone{
+		NewZone("example.test", 2, 60, []Record{
+			{Name: "www.example.test", Type: TypeA, Value: "10.0.0.1", TTL: 300},
+			// Alias crosses the delegation cut into the brand-new zone.
+			{Name: "alias.example.test", Type: TypeCNAME, Value: "host.biz.example.test", TTL: 300},
+			{Name: "biz.example.test", Type: TypeNS, Value: "ns1.biz.example.test", TTL: 3600},
+			{Name: "shop.example.test", Type: TypeNS, Value: "ns1.shop.example.test", TTL: 3600},
+		}),
+		// A zone that exists nowhere in the official directory.
+		NewZone("biz.example.test", 1, 30, []Record{
+			{Name: "host.biz.example.test", Type: TypeA, Value: "10.2.2.2", TTL: 300},
+		}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Direct query of a name in the directory-unknown zone.
+	res, err := r.ResolveCandidate(id, "host.biz.example.test")
+	if err != nil {
+		t.Fatalf("new zone in candidate returned %v, want authoritative answer", err)
+	}
+	if res.Records[0].Value != "10.2.2.2" || res.Source.String() != "biz.example.test@v1" ||
+		res.View != "candidate:"+id {
+		t.Fatalf("new zone answer wrong: %+v", res)
+	}
+	// The live directory still has no such zone.
+	if res, err := r.Resolve("host.biz.example.test"); err == nil {
+		t.Fatalf("new zone leaked into live view: %+v", res)
+	}
+	// Cross-zone alias from a candidate zone into the new zone resolves.
+	res, err = r.ResolveCandidate(id, "alias.example.test")
+	if err != nil {
+		t.Fatalf("cross-zone alias into new zone: %v", err)
+	}
+	if res.Records[0].Value != "10.2.2.2" || len(res.Chain) != 1 {
+		t.Fatalf("alias chain wrong: %+v", res)
+	}
+	// A negative answer inside the new zone stays in the candidate view.
+	if _, err := r.ResolveCandidate(id, "missing.biz.example.test"); err == nil ||
+		!strings.Contains(err.Error(), ErrNXDOMAIN) {
+		t.Fatalf("want NXDOMAIN inside candidate, got %v", err)
+	}
+	hasCandNeg := false
+	for _, e := range r.Candidate(id).cache.Snapshot() {
+		if e.Name == "missing.biz.example.test" && e.Negative && e.View == "candidate:"+id {
+			hasCandNeg = true
+		}
+	}
+	if !hasCandNeg {
+		t.Fatal("candidate negative not retained in candidate cache")
+	}
+	for _, e := range r.Cache().Snapshot() {
+		if e.View != "live" {
+			t.Fatalf("candidate answer leaked into live cache: %+v", e)
+		}
+	}
+
+	// Save/reopen: the same candidate view gives the same conclusions.
+	path := t.TempDir() + "/snap.json"
+	if err := r.SaveSnapshot(path); err != nil {
+		t.Fatal(err)
+	}
+	r2, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err = r2.ResolveCandidate(id, "host.biz.example.test")
+	if err != nil {
+		t.Fatalf("new zone after reopen: %v", err)
+	}
+	if res.Records[0].Value != "10.2.2.2" || res.Source.String() != "biz.example.test@v1" {
+		t.Fatalf("new zone answer after reopen wrong: %+v", res)
+	}
+	if _, err := r2.ResolveCandidate(id, "missing.biz.example.test"); err == nil ||
+		!strings.Contains(err.Error(), ErrNXDOMAIN) {
+		t.Fatalf("negative after reopen wrong: %v", err)
+	}
+	if res, err := r2.Resolve("host.biz.example.test"); err == nil {
+		t.Fatalf("live view after reopen should still lack the zone: %+v", res)
+	}
+}
+
+// TestStaleDepForOverriddenZone: even when the candidate carries its own
+// version of a live zone, movement of that official zone since the base
+// was captured must be reported as a stale dependency — the original
+// comparison basis changed. After recheck/adopt/abandon the actual basis
+// is recorded, and old answers keep corresponding to their original view.
+func TestStaleDepForOverriddenZone(t *testing.T) {
+	r := candidateOnTree(t, "v2") // overrides example.test, pinned at v1
+	if stale, _ := r.StaleDeps("v2"); len(stale) != 0 {
+		t.Fatalf("fresh candidate unexpectedly stale: %+v", stale)
+	}
+
+	// Capture the candidate answer resting on base example.test@1.
+	before, err := r.ResolveCandidate("v2", "www.example.test")
+	if err != nil || before.Records[0].Value != "10.0.0.99" ||
+		before.Source.String() != "example.test@v2" {
+		t.Fatalf("candidate answer: %+v %v", before, err)
+	}
+
+	// The official zone the candidate also carries moves.
+	if err := r.UpdateZone(NewZone("example.test", 3, 60, []Record{
+		{Name: "www.example.test", Type: TypeA, Value: "10.0.0.5", TTL: 300},
+		{Name: "shop.example.test", Type: TypeNS, Value: "ns1.shop.example.test", TTL: 3600},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := r.StaleDeps("v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, d := range stale {
+		if d.Zone == "example.test" && d.BaseVersion == 1 && d.CurrentVersion == 3 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("overridden zone movement not reported stale: %+v", stale)
+	}
+	// Adoption is refused up front (not only as a version clash later).
+	if _, err := r.AdoptCandidate("v2"); err == nil ||
+		!strings.Contains(err.Error(), "stale") {
+		t.Fatalf("adopt must refuse with stale deps: %v", err)
+	}
+	// The old candidate answer still corresponds to its original view.
+	again, err := r.ResolveCandidate("v2", "www.example.test")
+	if err != nil || again.Records[0].Value != "10.0.0.99" {
+		t.Fatalf("old answer should keep its view: %+v %v", again, err)
+	}
+
+	// Recheck re-pins the basis at v3 and clears view-private answers.
+	if _, err := r.RecheckCandidate("v2"); err != nil {
+		t.Fatal(err)
+	}
+	if stale, _ := r.StaleDeps("v2"); len(stale) != 0 {
+		t.Fatalf("stale after recheck: %+v", stale)
+	}
+	if _, err := r.ResolveCandidate("v2", "www.example.test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The candidate's own example.test@2 can no longer advance live v3;
+	// adoption surfaces that version conflict at apply time, after the
+	// stale-dependency gate already passed.
+	if _, err := r.AdoptCandidate("v2"); err == nil ||
+		!strings.Contains(err.Error(), "does not advance") {
+		t.Fatalf("adopt should report version conflict: %v", err)
+	}
+	// Abandon records the actual basis the trial ended on (rechecked v3).
+	ab, err := r.AbandonCandidate("v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ab.Basis["example.test"] != 3 {
+		t.Fatalf("abandonment basis should record rechecked live v3: %+v", ab.Basis)
+	}
+}

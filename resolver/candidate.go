@@ -97,20 +97,36 @@ func (r *Resolver) Candidate(id string) *Candidate {
 	return r.cands[id]
 }
 
-// view builds the candidate's consistent snapshot: candidate zones where
-// defined, otherwise the base-pinned historical version of each live
-// zone. Live zones that changed since the base was captured are still
-// seen at their base version here — never spliced with the candidate
-// zones from a different point in time.
+// view builds the candidate's consistent snapshot: the zone set the
+// candidate itself carries, overlaid on the base-pinned live zones. Live
+// zones that changed since the base was captured are still seen at their
+// base version here — never spliced with the candidate zones from a
+// different point in time. The enumerated zone set is the candidate's
+// own, so zones that do not exist in the official directory yet are
+// authoritative within this view.
 func (r *Resolver) candidateView(c *Candidate) zoneView {
-	return func(name string) *Zone {
-		if z, ok := c.Zones[name]; ok {
-			return z
-		}
-		if v, ok := c.Base[name]; ok {
-			return r.ZoneVersion(name, v)
-		}
-		return nil
+	return zoneView{
+		lookup: func(name string) *Zone {
+			if z, ok := c.Zones[name]; ok {
+				return z
+			}
+			if v, ok := c.Base[name]; ok {
+				return r.ZoneVersion(name, v)
+			}
+			return nil
+		},
+		names: func() []string {
+			names := make([]string, 0, len(c.Zones)+len(c.Base))
+			for zn := range c.Zones {
+				names = append(names, zn)
+			}
+			for zn := range c.Base {
+				if _, ok := c.Zones[zn]; !ok {
+					names = append(names, zn)
+				}
+			}
+			return names
+		},
 	}
 }
 
@@ -138,9 +154,10 @@ func (r *Resolver) StaleDeps(id string) ([]StaleDep, error) {
 	defer r.mu.RUnlock()
 	var stale []StaleDep
 	for zone, baseV := range c.Base {
-		if _, overridden := c.Zones[zone]; overridden {
-			continue // candidate carries its own version of this zone
-		}
+		// Even zones the candidate carries its own version of are
+		// dependencies whose original check basis moved: the trial
+		// answers were compared against the base version, and that
+		// comparison is outdated once the live zone advances.
 		s, ok := r.zones[zone]
 		if !ok {
 			stale = append(stale, StaleDep{Zone: zone, BaseVersion: baseV, Removed: true})

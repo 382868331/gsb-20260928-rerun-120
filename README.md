@@ -9,7 +9,7 @@
   - `cache.go` TTL 缓存:肯定/否定结果分别存储、分别过期(否定用区域 NegativeTTL);迟到更新(同区域更旧版本)被拒绝,来源 `Source{Zone, Version}` 可核对;区域发布新版本后,源自旧版本的缓存(含否定结果)立即失效;每条缓存注明所属视图(`View` 字段)。
   - `resolver.go` 迭代解析:沿 NS 委派下钻子区域,委派切点以下的上级记录一律不用;CNAME 可跨区追踪,带环路检测,错误中包含完整别名路径;保留全部区域版本历史,`ResolveAt` 按指定版本组合重放历史视图,结果 `Source` 指明答复出自哪组区域版本。
   - `batch.go` 区域批次变更:`PreviewBatch` 预演(记录增删 diff + 将失效的缓存条目,不改任何状态),`ApplyBatch` 整体校验后原子发布;`RollbackZone` 以新版本号重新发布旧内容(版本单调递增,回退本身也入历史);`RemoveZone` 撤销委派并清除该区域来源的缓存。
-  - `candidate.go` 候选查询视图:`NewCandidate` 在正式变更前登记彼此隔离的试用视图,同一份虚构查询可同时对当前区域(`Resolve`)和候选区域(`ResolveCandidate`)执行,`Compare` 给出两侧对照;每个候选有私有缓存,候选否定结果绝不进入正式缓存;候选把创建时的正式区域版本钉为基准(Base),一次查询只读到单一快照,不会把两个时间点的父子委派拼成有效答复;观察期间正式区域变化时 `StaleDeps` 指出过期依赖,`RecheckCandidate` 重新钉基准并清空候选缓存后可继续;`AdoptCandidate` 依赖过期时拒绝采用,采用时记录实际基于的区域集合(Basis);`AbandonCandidate` 放弃后保留相对基准的差异依据;`Overlaps` 报告相互重叠的候选。
+  - `candidate.go` 候选查询视图:`NewCandidate` 在正式变更前登记彼此隔离的试用视图,同一份虚构查询可同时对当前区域(`Resolve`)和候选区域(`ResolveCandidate`)执行,`Compare` 给出两侧对照;候选按其自身包含的区域集合(候选区域叠加基准区域)确定权威来源,正式目录尚不存在的全新区域、跨区别名与否定结果都只在所属视图内解析并留存,不依赖正式目录已有同名区域;每个候选有私有缓存,候选否定结果绝不进入正式缓存;候选把创建时的正式区域版本钉为基准(Base),一次查询只读到单一快照,不会把两个时间点的父子委派拼成有效答复;观察期间正式区域(含候选自带版本的同名区域)变化时 `StaleDeps` 指出原先核对基准已过期,`RecheckCandidate` 重新钉基准并清空候选缓存后可继续;`AdoptCandidate` 依赖过期时拒绝采用,重新核对后若候选版本无法超越当前正式版本则在采用时报版本冲突,采用时记录实际基于的区域集合(Basis);`AbandonCandidate` 放弃后保留相对基准的差异依据;`Overlaps` 报告相互重叠的候选。
   - `persist.go` JSON 快照(临时文件 + rename 原子写入),包含当前区域、完整版本历史、未过期缓存、候选视图与采用/放弃记录,重启后历史答复仍可解释来源,候选对照可继续。
 - `server/` — UDP 网络适配器(`QUERY <name>` / `QUERYAT <name> <zone@version,...>` / `CANDQUERY <id> <name>` / `COMPARE <id> <name>` 行协议),仅服务本地虚构区域。
 - `main.go` — 虚构区域树:root → example.test → shop.example.test。
