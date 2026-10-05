@@ -16,6 +16,8 @@ import (
 //
 //	REQUEST:  "QUERY <name>" | "QUERYAT <name> <zone@version,...>"
 //	          | "CANDQUERY <candidate-id> <name>" | "COMPARE <candidate-id> <name>"
+//	          | "JOINTNEW <review-id> <cand-id,...>" | "JOINTCHECK <review-id>"
+//	          | "JOINTADOPT <review-id>" | "JOINTABANDON <review-id>"
 //	RESPONSE: "OK <name> A <value> ..." | "CNAME <target> ..." | "ERR <code> <detail>"
 //
 // QUERYAT resolves against a historical view: each listed zone is pinned
@@ -86,7 +88,58 @@ func (s *Server) handle(q string) string {
 		return fmt.Sprintf("live=[%s] candidate=[%s] changed=%t",
 			outcome(cmp.Live, cmp.LiveErr), outcome(cmp.Candidate, cmp.CandErr), cmp.Changed())
 	}
-	return "ERR BADREQUEST want: QUERY <name> | QUERYAT <name> <zone@version,...> | CANDQUERY <id> <name> | COMPARE <id> <name>"
+	if len(parts) == 3 && strings.EqualFold(parts[0], "JOINTNEW") {
+		if _, err := s.core.NewJointReview(parts[1], strings.Split(parts[2], ",")); err != nil {
+			return "ERR BADREQUEST " + err.Error()
+		}
+		return "OK joint review " + parts[1] + " registered"
+	}
+	if len(parts) == 2 && strings.EqualFold(parts[0], "JOINTCHECK") {
+		rep, err := s.core.CheckJoint(parts[1])
+		if err != nil {
+			return "ERR BADREQUEST " + err.Error()
+		}
+		return formatJointReport(rep)
+	}
+	if len(parts) == 2 && strings.EqualFold(parts[0], "JOINTADOPT") {
+		ad, err := s.core.AdoptJoint(parts[1])
+		if err != nil {
+			return "ERR BADREQUEST " + err.Error()
+		}
+		return fmt.Sprintf("OK adopted %s members=%s", ad.ID, strings.Join(ad.Members, ","))
+	}
+	if len(parts) == 2 && strings.EqualFold(parts[0], "JOINTABANDON") {
+		if err := s.core.AbandonJoint(parts[1]); err != nil {
+			return "ERR BADREQUEST " + err.Error()
+		}
+		return "OK joint review " + parts[1] + " abandoned (candidates kept)"
+	}
+	return "ERR BADREQUEST want: QUERY <name> | QUERYAT <name> <zone@version,...> | CANDQUERY <id> <name> | COMPARE <id> <name> | JOINTNEW <id> <cand,...> | JOINTCHECK <id> | JOINTADOPT <id> | JOINTABANDON <id>"
+}
+
+// formatJointReport renders the joint check outcome on one line.
+func formatJointReport(rep *resolver.JointReport) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "ok=%t members=%s", rep.OK(), strings.Join(rep.Members, ","))
+	var zones []string
+	for _, z := range rep.Zones {
+		zones = append(zones, fmt.Sprintf("%s=%s@v%d", z.Zone, z.Source, z.Version))
+	}
+	fmt.Fprintf(&b, " zones=[%s]", strings.Join(zones, " "))
+	var probs []string
+	for _, p := range rep.Loops {
+		probs = append(probs, "loop:"+p.Detail)
+	}
+	for _, p := range rep.Missing {
+		probs = append(probs, fmt.Sprintf("missing:%s->%s", p.From, p.Target))
+	}
+	fmt.Fprintf(&b, " problems=[%s]", strings.Join(probs, " "))
+	var deps []string
+	for _, d := range rep.CrossDeps {
+		deps = append(deps, fmt.Sprintf("%s needs %s from %s", d.From, d.Name, d.ProvidedBy))
+	}
+	fmt.Fprintf(&b, " crossdeps=[%s]", strings.Join(deps, " "))
+	return b.String()
 }
 
 func (s *Server) answer(name string, pin map[string]uint64) string {

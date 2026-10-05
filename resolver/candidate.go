@@ -103,12 +103,21 @@ func (r *Resolver) Candidate(id string) *Candidate {
 // seen at their base version here — never spliced with the candidate
 // zones from a different point in time.
 func (r *Resolver) candidateView(c *Candidate) zoneView {
+	return r.overlayView(c.Zones, c.Base)
+}
+
+// overlayView builds a consistent snapshot: the given overlay zones
+// where defined, otherwise the base-pinned historical version of each
+// live zone. Live zones that changed since the base was captured are
+// still seen at their base version here — never spliced with the
+// overlay zones from a different point in time.
+func (r *Resolver) overlayView(overlay map[string]*Zone, base map[string]uint64) zoneView {
 	return zoneView{
 		get: func(name string) *Zone {
-			if z, ok := c.Zones[name]; ok {
+			if z, ok := overlay[name]; ok {
 				return z
 			}
-			if v, ok := c.Base[name]; ok {
+			if v, ok := base[name]; ok {
 				return r.ZoneVersion(name, v)
 			}
 			return nil
@@ -123,7 +132,7 @@ func (r *Resolver) candidateView(c *Candidate) zoneView {
 			for _, n := range names {
 				seen[n] = true
 			}
-			for zn := range c.Zones {
+			for zn := range overlay {
 				if !seen[zn] {
 					names = append(names, zn)
 				}

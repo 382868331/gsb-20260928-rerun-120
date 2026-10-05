@@ -10,12 +10,14 @@ import (
 // the full version history (so historical answers stay explainable after
 // a restart), and the live cache. Written atomically (temp file + rename).
 type Snapshot struct {
-	Zones      []Zone              `json:"zones"`
-	History    []Zone              `json:"history,omitempty"`
-	Cache      []CacheEntry        `json:"cache"`
-	Candidates []CandidateSnapshot `json:"candidates,omitempty"`
-	Adopted    []Adoption          `json:"adopted,omitempty"`
-	Abandoned  []Abandonment       `json:"abandoned,omitempty"`
+	Zones        []Zone              `json:"zones"`
+	History      []Zone              `json:"history,omitempty"`
+	Cache        []CacheEntry        `json:"cache"`
+	Candidates   []CandidateSnapshot `json:"candidates,omitempty"`
+	Adopted      []Adoption          `json:"adopted,omitempty"`
+	Abandoned    []Abandonment       `json:"abandoned,omitempty"`
+	Joints       []JointReview       `json:"joints,omitempty"`
+	JointAdopted []JointAdoption     `json:"joint_adopted,omitempty"`
 }
 
 // CandidateSnapshot is the durable form of a candidate view. The
@@ -48,6 +50,10 @@ func (r *Resolver) SaveSnapshot(path string) error {
 	}
 	snap.Adopted = r.adopted
 	snap.Abandoned = r.abandoned
+	for _, j := range r.joints {
+		snap.Joints = append(snap.Joints, *j)
+	}
+	snap.JointAdopted = r.jointAdopted
 	r.mu.RUnlock()
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
@@ -112,5 +118,10 @@ func LoadSnapshot(path string) (*Resolver, error) {
 	}
 	r.adopted = snap.Adopted
 	r.abandoned = snap.Abandoned
+	for i := range snap.Joints {
+		j := snap.Joints[i]
+		r.joints[j.ID] = &j
+	}
+	r.jointAdopted = snap.JointAdopted
 	return r, nil
 }
