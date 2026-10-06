@@ -52,9 +52,11 @@ type Resolver struct {
 	mu   sync.RWMutex
 	hist map[string][]*Zone // zone name -> versions, ascending
 
-	cands     map[string]*Candidate // isolated candidate query views
-	adopted   []Adoption            // log of adopted candidates and their basis
-	abandoned []Abandonment         // log of abandoned candidates and their diffs
+	cands      map[string]*Candidate    // isolated candidate query views
+	sets       map[string]*CandidateSet // joint review sets
+	setAdopted []SetAdoption            // log of adopted sets and their basis
+	adopted    []Adoption               // log of adopted candidates and their basis
+	abandoned  []Abandonment            // log of abandoned candidates and their diffs
 }
 
 func NewResolver(cache *Cache) *Resolver {
@@ -63,6 +65,7 @@ func NewResolver(cache *Cache) *Resolver {
 		cache: cache,
 		hist:  make(map[string][]*Zone),
 		cands: make(map[string]*Candidate),
+		sets:  make(map[string]*CandidateSet),
 	}
 }
 

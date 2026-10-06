@@ -8,7 +8,9 @@ import (
 
 // Snapshot is the durable state of the resolver: current zone versions,
 // the full version history (so historical answers stay explainable after
-// a restart), and the live cache. Written atomically (temp file + rename).
+// a restart), the live cache, candidate views, and joint review sets
+// with their pending adoption records. Written atomically (temp file +
+// rename).
 type Snapshot struct {
 	Zones      []Zone              `json:"zones"`
 	History    []Zone              `json:"history,omitempty"`
@@ -16,6 +18,8 @@ type Snapshot struct {
 	Candidates []CandidateSnapshot `json:"candidates,omitempty"`
 	Adopted    []Adoption          `json:"adopted,omitempty"`
 	Abandoned  []Abandonment       `json:"abandoned,omitempty"`
+	Sets       []SetSnapshot       `json:"sets,omitempty"`
+	SetAdopted []SetAdoption       `json:"set_adopted,omitempty"`
 }
 
 // CandidateSnapshot is the durable form of a candidate view. The
@@ -25,6 +29,15 @@ type CandidateSnapshot struct {
 	ID    string            `json:"id"`
 	Zones []Zone            `json:"zones"`
 	Base  map[string]uint64 `json:"base"`
+}
+
+// SetSnapshot is the durable form of a joint review set. The set's
+// private cache is not persisted; the pending review resumes from the
+// same members and pinned base after a restart.
+type SetSnapshot struct {
+	ID      string            `json:"id"`
+	Members []string          `json:"members"`
+	Base    map[string]uint64 `json:"base"`
 }
 
 // SaveSnapshot persists zones and live cache entries to path.
@@ -48,6 +61,14 @@ func (r *Resolver) SaveSnapshot(path string) error {
 	}
 	snap.Adopted = r.adopted
 	snap.Abandoned = r.abandoned
+	for _, s := range r.sets {
+		snap.Sets = append(snap.Sets, SetSnapshot{
+			ID:      s.ID,
+			Members: append([]string(nil), s.Members...),
+			Base:    s.Base,
+		})
+	}
+	snap.SetAdopted = r.setAdopted
 	r.mu.RUnlock()
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
@@ -62,7 +83,9 @@ func (r *Resolver) SaveSnapshot(path string) error {
 
 // LoadSnapshot rebuilds a resolver from a snapshot file. Zones are
 // registered at their saved versions; still-valid cache entries are
-// restored so a restart serves identical answers.
+// restored so a restart serves identical answers. Pending joint review
+// sets come back with their members and pinned base, so an interrupted
+// review can be re-checked and confirmed.
 func LoadSnapshot(path string) (*Resolver, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -112,5 +135,15 @@ func LoadSnapshot(path string) (*Resolver, error) {
 	}
 	r.adopted = snap.Adopted
 	r.abandoned = snap.Abandoned
+	for i := range snap.Sets {
+		ss := snap.Sets[i]
+		r.sets[ss.ID] = &CandidateSet{
+			ID:      ss.ID,
+			Members: ss.Members,
+			Base:    ss.Base,
+			cache:   NewCache(),
+		}
+	}
+	r.setAdopted = snap.SetAdopted
 	return r, nil
 }

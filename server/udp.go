@@ -24,7 +24,10 @@ import (
 //
 // CANDQUERY resolves inside an isolated candidate view; COMPARE runs the
 // same query against the live view and the candidate and reports both
-// outcomes side by side.
+// outcomes side by side. SETQUERY resolves inside a joint review set
+// (several candidates as one pending adoption set); SETREVIEW reports
+// the set's joint check: readiness, per-zone version attribution, alias
+// loops, missing targets and stale dependencies.
 type Server struct {
 	core *resolver.Resolver
 	conn *net.UDPConn
@@ -81,12 +84,43 @@ func (s *Server) handle(q string) string {
 		}
 		return formatResult(res)
 	}
+	if len(parts) == 3 && strings.EqualFold(parts[0], "SETQUERY") {
+		res, err := s.core.ResolveSet(parts[1], parts[2])
+		if err != nil {
+			if re, ok := err.(*resolver.ResolveError); ok {
+				return "ERR " + re.Code + " " + re.Error()
+			}
+			return "ERR INTERNAL " + err.Error()
+		}
+		return formatResult(res)
+	}
+	if len(parts) == 2 && strings.EqualFold(parts[0], "SETREVIEW") {
+		rev, err := s.core.ReviewSet(parts[1])
+		if err != nil {
+			return "ERR INTERNAL " + err.Error()
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "ready=%t members=%v", rev.Ready, rev.Members)
+		for _, z := range rev.Zones {
+			fmt.Fprintf(&b, " zone=%s@%d(%s)", z.Zone, z.Version, z.Origin)
+		}
+		for _, l := range rev.Loops {
+			fmt.Fprintf(&b, " loop=%s", strings.Join(l, "->"))
+		}
+		for _, m := range rev.Missing {
+			fmt.Fprintf(&b, " missing=%s->%s(%s)", m.Owner, m.Target, m.Code)
+		}
+		for _, d := range rev.Stale {
+			fmt.Fprintf(&b, " stale=%s", d.Zone)
+		}
+		return b.String()
+	}
 	if len(parts) == 3 && strings.EqualFold(parts[0], "COMPARE") {
 		cmp := s.core.Compare(parts[1], parts[2])
 		return fmt.Sprintf("live=[%s] candidate=[%s] changed=%t",
 			outcome(cmp.Live, cmp.LiveErr), outcome(cmp.Candidate, cmp.CandErr), cmp.Changed())
 	}
-	return "ERR BADREQUEST want: QUERY <name> | QUERYAT <name> <zone@version,...> | CANDQUERY <id> <name> | COMPARE <id> <name>"
+	return "ERR BADREQUEST want: QUERY <name> | QUERYAT <name> <zone@version,...> | CANDQUERY <id> <name> | COMPARE <id> <name> | SETQUERY <set-id> <name> | SETREVIEW <set-id>"
 }
 
 func (s *Server) answer(name string, pin map[string]uint64) string {
